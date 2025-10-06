@@ -28,64 +28,94 @@ void IECAnalyzer::markError(U64 sample, Channel& channel)
 	mResults->AddMarker(sample, AnalyzerResults::ErrorX, channel);
 }
 
-void IECAnalyzer::findBusStart()
+void IECAnalyzer::markByteStart(U64 sample)
 {
-	// Look for an idle bus (at least 2ms) to start
-	// Bus can only be idle while ATN is high
-	if (mATN->GetBitState() == BIT_LOW)
-	{
-		mATN->AdvanceToNextEdge();
-		mCLK->AdvanceToAbsPosition(mATN->GetSampleNumber());
-		mDATA->AdvanceToAbsPosition(mATN->GetSampleNumber());
-	}
+	mResults->AddMarker(sample, AnalyzerResults::Start, mSettings.mDataChannel);
+}
 
-	U32 samples_1ms = mSampleRateHz / 1000;
-	
-	// While ATN is HIGH, keep checking for idle bus.
-	// If ATN goes LOw again, we can assume that as the bus starting and start
-	// analyzing from there
-	while (mATN->GetBitState() == BIT_HIGH)
+void IECAnalyzer::markByteEnd(U64 sample)
+{
+	mResults->AddMarker(sample, AnalyzerResults::Stop, mSettings.mDataChannel);
+}
+
+void IECAnalyzer::markCmdStart(U64 endSample) 
+{
+	if (cmdStartSignaled) return;
+	cmdStartSignaled = true;
+
+	Frame frame;
+	frame.mData1 = 0;
+	frame.mFlags = 0;
+	frame.mType = (U8)IECFrameType::CommandStart;
+	frame.mStartingSampleInclusive = atnStart;
+	frame.mEndingSampleInclusive = endSample;
+
+	mResults->AddFrame( frame );
+	mResults->CommitResults();
+	ReportProgress( frame.mEndingSampleInclusive );
+}
+
+void IECAnalyzer::markEOI(U64 endSample)
+{
+	Frame frame;
+	frame.mData1 = 0;
+	frame.mFlags = 0;
+	frame.mType = (U8)IECFrameType::EOI;
+	frame.mStartingSampleInclusive = eoiStart;
+	frame.mEndingSampleInclusive = endSample;
+
+	mResults->AddFrame( frame );
+	mResults->CommitResults();
+	ReportProgress( frame.mEndingSampleInclusive );
+}
+
+void IECAnalyzer::markData(U64 endSample)
+{
+	Frame frame;
+	frame.mData1 = data;
+	frame.mFlags = 0;
+	frame.mType = (U8)IECFrameType::Data;
+	frame.mStartingSampleInclusive = dataStart;
+	frame.mEndingSampleInclusive = endSample;
+
+	mResults->AddFrame( frame );
+	mResults->CommitResults();
+	ReportProgress( frame.mEndingSampleInclusive );
+}
+
+bool IECAnalyzer::checkAtnChange()
+{
+	if (mATN->GetBitState() == BIT_LOW) 
 	{
-		if (mCLK->GetBitState() == BIT_HIGH && mDATA->GetBitState() == BIT_HIGH)
+		if (!foundATN) {
+			foundATN = true;
+			cmdStartSignaled = false;
+			atnStart = mATN->GetSampleNumber();
+			return true;
+		}
+	} else 
+	{
+		if (foundATN)
 		{
-			// Bus is idle! Now just verify length.
-			U64 lookahead = mATN->GetSampleNumber() + samples_1ms;
-			bool clkStaysHigh = !mCLK->WouldAdvancingToAbsPositionCauseTransition(lookahead);
-			bool dataStaysHigh = !mDATA->WouldAdvancingToAbsPositionCauseTransition(lookahead);
-			bool atnStaysHigh = !mATN->WouldAdvancingToAbsPositionCauseTransition(lookahead);
-			if (clkStaysHigh && dataStaysHigh && atnStaysHigh)
-			{
-				// WOO!
-				return;
-			} else {
-				U64 skip;
-				if (!clkStaysHigh) {
-					skip = mCLK->GetSampleOfNextEdge();
-				} else if(!dataStaysHigh) {
-					skip = mDATA->GetSampleOfNextEdge();
-				} else if (!atnStaysHigh)
-				{
-					skip = mATN->GetSampleOfNextEdge();
-				} else {
-					// throw error?
-				}
-				mATN->AdvanceToAbsPosition(skip);
-				mDATA->AdvanceToAbsPosition(skip);
-				mCLK->AdvanceToAbsPosition(skip);
-			}
-		} else {
-			// Tick forward to keep looking
-			mATN->Advance(1);
-			mCLK->Advance(1);
-			mDATA->Advance(1);
+			foundATN = false;
+			return true;
 		}
 	}
 
-	// ATN went low, return now to start analyzing
+	return false;
+}
+
+void IECAnalyzer::tick()
+{
+	mCLK->Advance(1);
+	mDATA->Advance(1);
+	mATN->Advance(1);
 }
 
 void IECAnalyzer::WorkerThread()
 {
+	foundATN = false;
+	cmdStartSignaled = false;
 	mSampleRateHz = GetSampleRate();
 	mATN = GetAnalyzerChannelData( mSettings.mAttentionChannel );
 	mCLK = GetAnalyzerChannelData( mSettings.mClockChannel );
@@ -96,192 +126,96 @@ void IECAnalyzer::WorkerThread()
 
 	while (true)
 	{
-		// Find either idle bus or start of a new CMD
-		findBusStart();
+		checkAtnChange();
 
-		if (mATN->GetBitState() == BIT_HIGH)
+		// both lines low indicate getting ready for data transfer
+		if (mCLK->GetBitState() == BIT_LOW && mDATA->GetBitState() == BIT_LOW)
 		{
-			// go to transaction start
-			mATN->AdvanceToNextEdge();
+			ReadByte();
 		}
 
-		TransactionStart();
-		
-		//mResults->AddMarker(cmdStart, AnalyzerResults::Start, mSettings.mAttentionChannel);
-		//mResults->AddMarker(cmdEnd, AnalyzerResults::Stop, mSettings.mAttentionChannel);
-
-		//ReportProgress( cmdEnd );
-	}
-
-	/*if( mSerial->GetBitState() == BIT_LOW )
-		mSerial->AdvanceToNextEdge();
-
-	U32 samples_per_bit = mSampleRateHz / mSettings.mBitRate;
-	U32 samples_to_first_center_of_first_data_bit = U32( 1.5 * double( mSampleRateHz ) / double( mSettings.mBitRate ) );
-
-	for( ; ; )
-	{
-		U8 data = 0;
-		U8 mask = 1 << 7;
-		
-		mSerial->AdvanceToNextEdge(); //falling edge -- beginning of the start bit
-
-		U64 starting_sample = mSerial->GetSampleNumber();
-
-		mSerial->Advance( samples_to_first_center_of_first_data_bit );
-
-		for( U32 i=0; i<8; i++ )
-		{
-			//let's put a dot exactly where we sample this bit:
-			mResults->AddMarker( mSerial->GetSampleNumber(), AnalyzerResults::Dot, mSettings.mInputChannel );
-
-			if( mSerial->GetBitState() == BIT_HIGH )
-				data |= mask;
-
-			mSerial->Advance( samples_per_bit );
-
-			mask = mask >> 1;
-		}
-
-
-		//we have a byte to save. 
-		Frame frame;
-		frame.mData1 = data;
-		frame.mFlags = 0;
-		frame.mStartingSampleInclusive = starting_sample;
-		frame.mEndingSampleInclusive = mSerial->GetSampleNumber();
-
-		mResults->AddFrame( frame );
-		mResults->CommitResults();
-		ReportProgress( frame.mEndingSampleInclusive );
-	}*/
-}
-
-void IECAnalyzer::TransactionStart()
-{
-	bool isEOI;
-
-	// ATN went low to start the transaction
-	U64 start = mATN->GetSampleNumber();
-	mCLK->AdvanceToAbsPosition(start);
-	mDATA->AdvanceToAbsPosition(start);
-
-	// Wait for sender (clk) and receiver (data) to respond by pulling LOW
-	while (mCLK->GetBitState() == BIT_HIGH || mDATA->GetBitState() == BIT_HIGH)
-	{
-		mATN->Advance(1);
-		mCLK->Advance(1);
-		mDATA->Advance(1);
-		// Verify ATN is still in valid state
-		if (mATN->GetBitState() == BIT_HIGH)
-		{
-			// Error
-			markError(mATN->GetSampleNumber(), mSettings.mAttentionChannel);
-			return;
-		}
-	}
-
-	// Command is ready to send
-	Frame frame;
-	frame.mData1 = 0;
-	frame.mFlags = 0;
-	frame.mType = (U8)IECFrameType::CommandStart;
-	frame.mStartingSampleInclusive = start;
-	frame.mEndingSampleInclusive = mCLK->GetSampleOfNextEdge();
-
-	mResults->AddFrame( frame );
-	mResults->CommitResults();
-	ReportProgress( frame.mEndingSampleInclusive );
-
-	// Get time when CMD ends
-	mATN->AdvanceToNextEdge();
-	while (mCLK->WouldAdvancingToAbsPositionCauseTransition(mATN->GetSampleNumber()))
-	{
-		if (!ReadByte(&isEOI, true)) return;
-	}
-
-	// Read all command bytes, move everything to end of ATN
-	mCLK->AdvanceToAbsPosition(mATN->GetSampleNumber());
-	mDATA->AdvanceToAbsPosition(mATN->GetSampleNumber());
-
-	isEOI = false;
-
-	// Attempt to read "normal" bytes. If it fails, it's likely because
-	// ATN was started again
-	while(ReadByte(&isEOI, false)) {
-		
+		tick();
 	}
 }
 
-// Called on the rising edge of DATA
-// TODO need to check for attention interrupts during normal bytes
-bool IECAnalyzer::ReadByte(bool* isEOI, bool isCMD)
+void IECAnalyzer::ReadByte()
 {
 	// Transaction starts once both sender (clk) and receiver (data) are HIGH
 	while (mCLK->GetBitState() == BIT_LOW || mDATA->GetBitState() == BIT_LOW)
 	{
-		mCLK->Advance(1);
-		mDATA->Advance(1);
-
-		if (!isCMD) {
-			mATN->AdvanceToAbsPosition(mDATA->GetSampleNumber());
-			if (mATN->GetBitState() == BIT_LOW) {
-				// Begin new transaction
-				TransactionStart();
-				return false;
-			}
+		if (checkAtnChange()) {
+			markByteEnd(mDATA->GetSampleNumber());
+			return;
 		}
+		tick();
 	}
 
-	// Check for EOI
-	mCLK->AdvanceToNextEdge();
-	double eoiSignalLength = getTimeUS(mDATA->GetSampleNumber(), mCLK->GetSampleNumber());
-	*isEOI = false;
-	if (eoiSignalLength >= 200) {
-		// EOI detected
-		*isEOI = true;
+	if (foundATN)
+		markCmdStart(mATN->GetSampleNumber() - 1);
 
-		if (isCMD)
+	// Now check for EOI signal or transmission start
+	eoiStart = mDATA->GetSampleNumber();
+	while (mCLK->GetBitState() == BIT_HIGH && mDATA->GetBitState() == BIT_HIGH)
+	{
+		if (checkAtnChange()) {
+			markByteEnd(mDATA->GetSampleNumber());
+			return;
+		}
+		tick();
+	}
+
+	if (mDATA->GetBitState() == BIT_LOW)
+	{
+		// EOI. Data MUST go high before clock goes low
+		while (mDATA->GetBitState() == BIT_LOW)
 		{
-			// EOI shouldnt happen during CMD
-			markError(mCLK->GetSampleNumber(), mSettings.mClockChannel);
-			return false;
+			if (checkAtnChange()) {
+				markByteEnd(mDATA->GetSampleNumber());
+				return;
+			}
+			if (mCLK->GetBitState() == BIT_LOW) 
+			{
+				markError(mCLK->GetSampleNumber(), mSettings.mClockChannel);
+				return;
+			}
+			tick();
 		}
 
-		U64 eoiStart = mDATA->GetSampleNumber();
-
-		// DATA will go low then high again
-		mDATA->AdvanceToNextEdge();
-		if (mDATA->GetBitState() != BIT_LOW || mDATA->GetSampleNumber() >= mCLK->GetSampleNumber()) {
-			markError(mDATA->GetSampleNumber(), mSettings.mDataChannel);
-			return false;
+		// Finally wait for transmission start
+		while (mCLK->GetBitState() == BIT_HIGH)
+		{
+			if (checkAtnChange()) {
+				markByteEnd(mDATA->GetSampleNumber());
+				return;
+			}
+			if (mDATA->GetBitState() != BIT_HIGH) 
+			{
+				markError(mDATA->GetSampleNumber(), mSettings.mDataChannel);
+				return;
+			}
+			tick();
 		}
-		U64 eoiAckStart = mDATA->GetSampleNumber();
-		mDATA->AdvanceToNextEdge();
-		double eoiAckTime = getTimeUS(eoiAckStart, mDATA->GetSampleNumber()); // Must be at last 60us
-		if (mDATA->GetBitState() != BIT_HIGH || mDATA->GetSampleNumber() >= mCLK->GetSampleNumber() || eoiAckTime < 60.0){
-			markError(mDATA->GetSampleNumber(), mSettings.mDataChannel);
-			return false;
-		}
 
-		Frame frameEOI;
-		frameEOI.mData1 = 0;
-		frameEOI.mFlags = 0;
-		frameEOI.mType = (U8)IECFrameType::EOI;
-		frameEOI.mStartingSampleInclusive = eoiStart;
-		frameEOI.mEndingSampleInclusive = mCLK->GetSampleNumber();
-
-		mResults->AddFrame( frameEOI );
-		mResults->CommitResults();
-		ReportProgress( frameEOI.mEndingSampleInclusive );
+		markEOI(mCLK->GetSampleNumber() - 1);
 	}
 
-	U64 dataStart = mCLK->GetSampleNumber() + 1;
-	U64 data = 0;
+	markByteStart(mDATA->GetSampleNumber());
+
+	// Start reading bits
+	dataStart = mCLK->GetSampleNumber();
+	data = 0;
 	for (int i = 0; i < 8; i ++) {
-		// Wait for high pulse
-		mCLK->AdvanceToNextEdge();
-		mDATA->AdvanceToAbsPosition(mCLK->GetSampleNumber());
+		// Wait for clock pulse
+		while (mCLK->GetBitState() != BIT_HIGH)
+		{
+			if (checkAtnChange()) {
+				markByteEnd(mDATA->GetSampleNumber());
+				return;
+			}
+			tick();
+		}
+
+		// clock pusled, read data pin
 		data >>= 1; // LSB gets transmitted first
 		if (mDATA->GetBitState() == BIT_HIGH)
 		{
@@ -293,40 +227,48 @@ bool IECAnalyzer::ReadByte(bool* isEOI, bool isCMD)
 		}
 		
 		// Wait for clock to go LOW again
-		mCLK->AdvanceToNextEdge();
+		while (mCLK->GetBitState() != BIT_LOW)
+		{
+			if (checkAtnChange()) {
+				markByteEnd(mDATA->GetSampleNumber());
+				return;
+			}
+			tick();
+		}
 	}
 
 	// Wait for DATA to go high 
-	mDATA->AdvanceToAbsPosition(mCLK->GetSampleNumber());
-	while (mDATA->GetBitState() != BIT_HIGH) mDATA->AdvanceToNextEdge();
+	while (mDATA->GetBitState() != BIT_HIGH)
+	{
+		if (checkAtnChange()) {
+			markByteEnd(mDATA->GetSampleNumber());
+			return;
+		}
+		if (mCLK->GetBitState() != BIT_LOW) 
+		{
+			markError(mCLK->GetSampleNumber(), mSettings.mClockChannel);
+			return;
+		}
+		tick();
+	}
 	
 	// Wait for DATA to be pulled low, indicated data received
-	mDATA->AdvanceToNextEdge();
-	if (mCLK->WouldAdvancingToAbsPositionCauseTransition(mDATA->GetSampleNumber())){
-		mCLK->AdvanceToNextEdge();
-		markError(mCLK->GetSampleNumber(), mSettings.mClockChannel);
-		return false;
+	while (mDATA->GetBitState() != BIT_LOW)
+	{
+		if (checkAtnChange()) {
+			markByteEnd(mDATA->GetSampleNumber());
+			return;
+		}
+		if (mCLK->GetBitState() != BIT_LOW) 
+		{
+			markError(mCLK->GetSampleNumber(), mSettings.mClockChannel);
+			return;
+		}
+		tick();
 	}
 
-	// sync samples
-	mCLK->AdvanceToAbsPosition(mDATA->GetSampleNumber()); 
-	if (!isCMD) {
-		mATN->AdvanceToAbsPosition(mDATA->GetSampleNumber());
-	}
-
-	// Save transmitted data
-	Frame frame;
-	frame.mData1 = data;
-	frame.mFlags = 0;
-	frame.mType = (U8)IECFrameType::Command;
-	frame.mStartingSampleInclusive = dataStart;
-	frame.mEndingSampleInclusive = mDATA->GetSampleNumber();
-
-	mResults->AddFrame( frame );
-	mResults->CommitResults();
-	ReportProgress( frame.mEndingSampleInclusive );
-
-	return true;
+	markData(mCLK->GetSampleNumber());
+	markByteEnd(mDATA->GetSampleNumber());
 }
 
 bool IECAnalyzer::NeedsRerun()

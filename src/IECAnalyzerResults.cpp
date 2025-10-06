@@ -29,7 +29,7 @@ void IECAnalyzerResults::GenerateBubbleText( U64 frame_index, Channel& channel, 
 		AddResultString("Command Start");
 	} else if (type == IECFrameType::EOI) {
 		AddResultString("EOI");
-	} else if (type == IECFrameType::Command) {
+	} else if (type == IECFrameType::Data) {
 		AnalyzerHelpers::GetNumberString( frame.mData1, display_base, 8, number_str, 128 );
 		AddResultString(number_str);
 	}

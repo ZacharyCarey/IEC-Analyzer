@@ -15,7 +15,7 @@ enum class IECFrameType : U8
 	Default = 0,
 	CommandStart = 1,
 	EOI = 2,
-	Command = 3
+	Data = 3
 };
 
 class ANALYZER_EXPORT IECAnalyzer : public Analyzer2
@@ -40,14 +40,25 @@ protected: //vars
 	AnalyzerChannelData* mCLK;
 	AnalyzerChannelData* mDATA;
 	U32 mSampleRateHz;
+	bool foundATN;
+	bool cmdStartSignaled;
+	U64 atnStart;
+	U64 eoiStart;
+	U64 dataStart;
+	U64 data;
 
 	IECSimulationDataGenerator mSimulationDataGenerator;
 	bool mSimulationInitilized;
 
 	void markError(U64 sample, Channel& channel);
-	void findBusStart();
-	void TransactionStart();
-	bool ReadByte(bool* isEOI, bool isCMD);
+	void markByteStart(U64 sample);
+	void markByteEnd(U64 sample);
+	void ReadByte();
+	void markCmdStart(U64 endSample);
+	void markEOI(U64 endSample);
+	void markData(U64 endSample);
+	bool checkAtnChange();
+	void tick();
 
 private:
 	double getTimeUS(U64 sampleStart, U64 sampleEnd)
